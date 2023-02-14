@@ -3,5 +3,5 @@
 require_once "./src.php"; // Microsoft Graph API
 
 $microsoftOutlookGraph = new MicrosoftOutlookGraph();
-$microsoftOutlookGraph->authorization();
+$microsoftOutlookGraph->authorization($_GET["company"]);
 

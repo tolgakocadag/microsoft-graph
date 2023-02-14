@@ -3,4 +3,7 @@
 require_once "./src.php"; // Microsoft Graph API
 
 $microsoftOutlookGraph = new MicrosoftOutlookGraph();
-$microsoftOutlookGraph->setUserInfo();
+$microsoftOutlookGraph->getMail(
+    $_POST["email_address"]
+);
+
