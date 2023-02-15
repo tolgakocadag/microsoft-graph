@@ -66,12 +66,60 @@ class MicrosoftOutlookGraph {
         return new \League\OAuth2\Client\Provider\GenericProvider([
             'clientId'                => APPLICATION[$this->company]["client_id"],
             'clientSecret'            => APPLICATION[$this->company]["client_secret"],
-            'redirectUri'             => "https://callcenter.spechy.live/microsoft/exxen.php",
+            'redirectUri'             => "https://wa.spechy.com/microsoft-graph/response.php",
             'urlAuthorize'            => "https://login.microsoftonline.com/".APPLICATION[$this->company]["tenant_id"]."/oauth2/v2.0/authorize",
             'urlAccessToken'          => "https://login.microsoftonline.com/".APPLICATION[$this->company]["tenant_id"]."/oauth2/v2.0/token",
             'urlResourceOwnerDetails' => '',
             'scopes'                  => APPLICATION[$this->company]["scope"]
         ]);
+    }
+
+    public function response(string $code,string $state,string $session_state){
+        global $sql;
+
+        $sqlquery = $sql->prepare("SELECT * FROM accounts WHERE state = ? AND status = 0");
+        $sqlquery->bindvalue(1, $this->lastVariableBender($state), PDO::PARAM_STR);
+        $sqlquery->execute();
+        $account = $sqlquery->fetch(PDO::FETCH_OBJ);
+
+        if (!empty($account->account_id)){
+            $this->company = $account->company;
+            $provider = $this->authProvider();
+            $access_token = $provider->getAccessToken('authorization_code', [
+                'code'     => $this->lastVariableBender($code)
+            ]);
+
+            $sqlquery = $sql->prepare("UPDATE accounts SET access_token = ?, refresh_token = ?, code = ?, session_state = ?, updated_at = ?, status = 1 WHERE state = ?");
+            $sqlquery->bindvalue(1, $access_token->getToken(), PDO::PARAM_STR);
+            $sqlquery->bindvalue(2, $access_token->getRefreshToken(), PDO::PARAM_STR);
+            $sqlquery->bindvalue(3, $this->lastVariableBender($code), PDO::PARAM_STR);
+            $sqlquery->bindvalue(4, $this->lastVariableBender($session_state), PDO::PARAM_STR);
+            $sqlquery->bindvalue(5, Date("Y-m-d H:i:s"), PDO::PARAM_STR);
+            $sqlquery->bindvalue(6, $this->lastVariableBender($state), PDO::PARAM_STR);
+            $sqlquery->execute();
+
+            $this->setUserInfo();
+
+            echo "Hesap Bağlandı";
+        }
+    }
+
+    //:TODO DOMAİNDEN SONRA
+    private function refreshAccessToken($account){
+        global $sql;
+        $this->company = $account->company;
+        $provider = $this->authProvider();
+
+        $access_token = $provider->getAccessToken('refresh_token', [
+            'refresh_token' => $account->refresh_token
+        ]);
+
+        $sqlquery = $sql->prepare("UPDATE accounts SET access_token = ?, refresh_token = ?, updated_at = ? WHERE account_id = ?");
+        $sqlquery->bindvalue(1, $access_token->getToken(), PDO::PARAM_STR);
+        $sqlquery->bindvalue(2, $access_token->getRefreshToken(), PDO::PARAM_STR);
+        $sqlquery->bindvalue(3, Date("Y-m-d H:i:s"), PDO::PARAM_STR);
+        $sqlquery->bindvalue(4, $account->account_id, PDO::PARAM_STR);
+        $sqlquery->execute();
     }
 
     /**
@@ -113,7 +161,7 @@ class MicrosoftOutlookGraph {
         }
     }
 
-    public function sendMail(string $email_address,string $subject,string $body,$toRecipients){
+    public function sendMail(string $email_address,string $subject,string $body,string $toRecipients,string $ccRecipients = "", string $bccRecipients = "",string $attachments){
         global $sql;
 
         $sqlquery = $sql->prepare("SELECT * FROM accounts WHERE email_address = ? AND status = 1");
@@ -122,6 +170,9 @@ class MicrosoftOutlookGraph {
         $account = $sqlquery->fetch(PDO::FETCH_OBJ);
 
         if (!empty($account->account_id)){
+
+            $this->refreshAccessToken($account);
+
             $this->setGraph($account->access_token);
 
             $mailBody = [
@@ -132,15 +183,54 @@ class MicrosoftOutlookGraph {
                         "content" => $this->lastVariableBender($body)
                     ],
                     "toRecipients" => [],
+                    "ccRecipients" => [],
+                    "bccRecipients" => [],
+                    'attachments' => []
                 ]
             ];
 
+            $toRecipients = explode(",",$toRecipients);
             foreach ($toRecipients as $toRecipient) {
                 $mailBody["Message"]["toRecipients"][] = [
                     "emailAddress" => [
                         "address" => $this->lastVariableBender($toRecipient)
                     ]
                 ];
+            }
+
+            if (!empty($ccRecipients)){
+                $ccRecipients = explode(",",$ccRecipients);
+                foreach ($ccRecipients as $ccRecipient) {
+                    $mailBody["Message"]["ccRecipients"][] = [
+                        "emailAddress" => [
+                            "address" => $this->lastVariableBender($ccRecipient)
+                        ]
+                    ];
+                }
+            }
+
+            if (!empty($bccRecipients)){
+                $bccRecipients = explode(",",$bccRecipients);
+                foreach ($bccRecipients as $bccRecipient) {
+                    $mailBody["Message"]["bccRecipients"][] = [
+                        "emailAddress" => [
+                            "address" => $this->lastVariableBender($bccRecipient)
+                        ]
+                    ];
+                }
+            }
+
+            if (!empty($attachments)){
+                $attachments = explode(",",$attachments);
+                foreach ($attachments as $attachment) {
+                    $b64 = base64_encode(file_get_contents($attachment));
+                    $mailBody["Message"]["attachments"][] = [
+                        '@odata.type' => '#microsoft.graph.fileAttachment',
+                        'Name' => basename($attachment),
+                        'ContentBytes' => $b64,
+                        'contentType' => get_headers($attachment, 1)['Content-Type'],
+                    ];
+                }
             }
 
             return $this->graph->createRequest("POST", "/me/sendMail")
@@ -151,13 +241,14 @@ class MicrosoftOutlookGraph {
 
     public function getMail(string $email_address){
         global $sql;
-
         $sqlquery = $sql->prepare("SELECT * FROM accounts WHERE email_address = ? AND status = 1");
         $sqlquery->bindvalue(1, $this->lastVariableBender($email_address), PDO::PARAM_STR);
         $sqlquery->execute();
         $account = $sqlquery->fetch(PDO::FETCH_OBJ);
 
         if (!empty($account->account_id)){
+
+            $this->refreshAccessToken($account);
 
             try {
                 $sql2 = new PDO('mysql:dbname='.APPLICATION[$account->company]["database"]["dbname"].';host='.APPLICATION[$account->company]["database"]["host"].';charset=utf8',''.APPLICATION[$account->company]["database"]["username"].'',''.APPLICATION[$account->company]["database"]["password"].'',array(PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8"));
@@ -190,19 +281,23 @@ class MicrosoftOutlookGraph {
                         $body = isset($mail["body"]["content"]) ? $mail["body"]["content"] : "";
                         $reply = isset($mail["replyTo"]["emailAddress"]["address"]) ? $mail["replyTo"]["emailAddress"]["address"] : $sender;
 
+                        $file_paths = [];
+                        $file_names = [];
 
-                        $to_recipients = "";
+                        $to_recipients = [];
                         if(isset($mail["toRecipients"])){
                             foreach ($mail["toRecipients"] as $recipient) {
-                                $to_recipients = empty($to_recipients) ? $recipient["emailAddress"]["address"] : $to_recipients . "," . $recipient["emailAddress"]["address"];
+                                $to_recipients[] = $recipient["emailAddress"]["address"];
                             }
+                            $to_recipients = implode(",",$to_recipients);
                         }
 
-                        $cc_recipients = "";
+                        $cc_recipients = [];
                         if(isset($mail["ccRecipients"])){
                             foreach ($mail["ccRecipients"] as $recipient) {
-                                $cc_recipients = empty($cc_recipients) ? $recipient["emailAddress"]["address"] : $cc_recipients . "," . $recipient["emailAddress"]["address"];
+                                $cc_recipients[] = $recipient["emailAddress"]["address"];
                             }
+                            $cc_recipients = implode(",",$cc_recipients);
                         }
 
                         echo "MAIL ID : " . $mail_id . "<br>";
@@ -217,15 +312,41 @@ class MicrosoftOutlookGraph {
                         echo "<hr>";
 
                         echo "<pre>";
-                        print_r($mail);
+
+                        if (isset($mail["hasAttachments"]) && $mail["hasAttachments"] == 1){
+                            $mail_attachments = $this->graph->createRequest("GET", '/me/messages/'.$mail_id.'/attachments')
+                                ->setReturnType(Model\Group::class)
+                                ->execute();
+                            foreach ($mail_attachments as $mail_attachment) {
+                                $mail_attachment = $mail_attachment->getProperties();
+                                !file_exists("./attachments") ? mkdir("./attachments") : "";
+                                !file_exists("./attachments/".Date("Y")) ? mkdir("./attachments/".Date("Y")): "";
+                                !file_exists("./attachments/".Date("Y")."/".Date("m")) ? mkdir("./attachments/".Date("Y")."/".Date("m")): "";
+                                !file_exists("./attachments/".Date("Y")."/".Date("m")."/".Date("d")) ? mkdir("./attachments/".Date("Y")."/".Date("m")."/".Date("d")): "";
+                                !file_exists("./attachments/".Date("Y")."/".Date("m")."/".Date("d")."/".$mail_attachment["id"]) ? mkdir("./attachments/".Date("Y")."/".Date("m")."/".Date("d")."/".$mail_attachment["id"]): "";
+                                $file_name = rand(10000000,99999999)."-".$this->lastVariableBender($mail_attachment["name"]);
+                                file_put_contents('./attachments/'.Date("Y")."/".Date("m")."/".Date("d").'/'.$mail_attachment["id"].'/'.$file_name, base64_decode($mail_attachment["contentBytes"]));
+
+                                $file_paths[] = 'http://35.195.74.217/microsoft-graph/attachments/'.Date("Y")."/".Date("m")."/".Date("d").'/'.$mail_attachment["id"].'/'.$file_name;
+                                $file_names[] = $file_name;
+                            }
+
+                            $node_datas = array('paths' => $file_paths);
+                            $response = json_decode($this->sendCurlRequest(APPLICATION[$account->company]["media_url"], $node_datas));
+                            $file_paths = $response->resPaths;
+                        }
+
+                        echo "<hr>";
+                        echo $body;
+                        echo "<hr>";
 
                         //mail check
-                        $remote_mail = $sql2->query("SELECT count(*) FROM gelenMailBilgiler
-                            where (gonderilmeTrh = ? OR mgid = ?) and kime = ? and kimden = ?")->fetchColumn();
-                        $remote_mail->bindvalue(1, $mail_send_date, PDO::PARAM_STR);
-                        $remote_mail->bindvalue(2, $mail_id, PDO::PARAM_STR);
-                        $remote_mail->bindvalue(3, $to_recipients, PDO::PARAM_STR);
-                        $remote_mail->bindvalue(4, $sender, PDO::PARAM_STR);
+                        $remote_mail = $sql2->prepare("SELECT * FROM gelenMailBilgiler
+                            where (gonderilmeTrh = ? OR mgid = ?) and kime = ? and kimden = ?");
+                        $remote_mail->bindparam(1, $mail_send_date, PDO::PARAM_STR);
+                        $remote_mail->bindparam(2, $mail_id, PDO::PARAM_STR);
+                        $remote_mail->bindparam(3, $to_recipients, PDO::PARAM_STR);
+                        $remote_mail->bindparam(4, $sender, PDO::PARAM_STR);
                         $remote_mail->execute();
                         $remote_mail = $remote_mail->fetch(PDO::FETCH_OBJ);
                         if (empty($remote_mail->id)){
@@ -265,9 +386,9 @@ class MicrosoftOutlookGraph {
                                 VALUES(?,?,?,?,?)");
                             $isMStmt->bindParam(1, $last_id, PDO::PARAM_INT);
                             $isMStmt->bindValue(2, base64_encode($body), PDO::PARAM_STR);
-                            $isMStmt->bindValue(3, "", PDO::PARAM_STR);
+                            $isMStmt->bindValue(3, implode(",",$file_paths), PDO::PARAM_STR);
                             $isMStmt->bindParam(4, $mail_id, PDO::PARAM_STR);
-                            $isMStmt->bindValue(5, "", PDO::PARAM_STR);
+                            $isMStmt->bindValue(5, implode(",",$file_names), PDO::PARAM_STR);
                             $isMStmt->execute();
 
                             $data = array(
@@ -285,7 +406,7 @@ class MicrosoftOutlookGraph {
                                 'visibility' => $mail_account->visibility
                             );
 
-                            $this->sendCurlRequest("https://callcenter.spechy.live/npbx/connect", $data);
+                            $this->sendCurlRequest(APPLICATION[$account->company]["redirect_url"], $data);
                         }
                         exit();
                     }
